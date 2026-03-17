@@ -34,74 +34,27 @@ jobs:
             qemu-system-x86 \
             qemu-utils \
             qemu-kvm \
-            cloud-image-utils \
-            genisoimage \
             openssh-client \
             sshpass \
             git-lfs \
-            curl wget screen \
+            curl wget \
             net-tools
-
-      - name: Find Free Ports
-        run: |
-          check_port() {
-            ss -tlnp | grep -q ":$1 " && echo "in use" || echo "free"
-          }
-          echo "Port 2222: $(check_port 2222)"
-          echo "Port 8443: $(check_port 8443)"
-          echo "Port 8080: $(check_port 8080)"
-          echo "Port 3000: $(check_port 3000)"
-          echo "Port 2055: $(check_port 2055)"
-
-      - name: Setup Storage
-        run: |
-          mkdir -p ~/vms
-          df -h
 
       - name: Download VM Image from Hugging Face
         run: |
           echo "Downloading VM image..."
           git lfs install
           git clone https://Paul1212crp:${{ secrets.HF_TOKEN }}@huggingface.co/datasets/Paul1212crp/nexusserver-vm /tmp/nexusserver-vm
-
-          # Copy directly to vms on main disk - 91G free, no decompression needed
+          mkdir -p ~/vms
           cp /tmp/nexusserver-vm/nexusserver.img.compressed ~/vms/nexusserver.img
-
           echo "Ready: $(du -sh ~/vms/nexusserver.img)"
           qemu-img info ~/vms/nexusserver.img
           df -h
-
-      - name: Create Seed ISO
-        run: |
-          cat > /tmp/user-data <<EOF
-          #cloud-config
-          ssh_pwauth: true
-          disable_root: false
-          chpasswd:
-            list: |
-              nexus:${{ secrets.SSH_PASSWORD }}
-              root:${{ secrets.SSH_PASSWORD }}
-            expire: false
-          runcmd:
-            - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-            - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-            - systemctl restart ssh
-          EOF
-
-          cat > /tmp/meta-data <<EOF
-          instance-id: nexusserver-gha
-          local-hostname: nexusserver
-          EOF
-
-          cloud-localds ~/vms/nexusserver-seed.iso \
-            /tmp/user-data /tmp/meta-data
-          echo "Seed ISO created"
 
       - name: Boot VM
         run: |
           sudo chmod 666 /dev/kvm
 
-          # Auto detect RAM and CPU - give VM 85%
           TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
           VM_RAM=$(( TOTAL_RAM * 85 / 100 ))
           CPUS=$(nproc)
@@ -115,7 +68,6 @@ jobs:
             -smp ${CPUS} \
             -cpu host,+x2apic \
             -drive file=$HOME/vms/nexusserver.img,format=qcow2,if=virtio,cache=writeback,discard=unmap,aio=threads \
-            -drive file=$HOME/vms/nexusserver-seed.iso,format=raw,if=virtio \
             -boot order=c \
             -device virtio-net-pci,netdev=n0 \
             -netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8443-:8443,hostfwd=tcp::8080-:8080,hostfwd=tcp::3000-:3000,hostfwd=tcp::2055-:2055 \
@@ -132,7 +84,8 @@ jobs:
         run: |
           echo "Waiting for VM SSH..."
           for i in {1..60}; do
-            if ssh -o StrictHostKeyChecking=no \
+            if sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+               ssh -o StrictHostKeyChecking=no \
                    -o UserKnownHostsFile=/dev/null \
                    -o ConnectTimeout=5 \
                    -p 2222 nexus@localhost \
@@ -175,7 +128,6 @@ jobs:
               rm -f /tmp/nexus-restart.sh
           else
               echo "❌ WARNING: No Pelican config found!"
-              echo "Skipping restart.sh - services will not start"
               echo "Contents of /root:"
               ls -la /root/ 2>/dev/null || true
               echo "Contents of /var/www:"
@@ -220,13 +172,10 @@ jobs:
           echo "Waiting for shutdown..."
           sleep 40
 
-          # Force kill if still running
           kill $(cat $HOME/vms/nexusserver.pid 2>/dev/null) 2>/dev/null || true
           sleep 5
 
-          # Compress directly on main disk
           echo "Compressing updated image..."
-          df -h
           qemu-img convert -O qcow2 -c \
             $HOME/vms/nexusserver.img \
             /tmp/nexusserver.img.compressed
@@ -236,13 +185,10 @@ jobs:
         run: |
           echo "Uploading updated image..."
           cd /tmp/nexusserver-vm
-
           cp /tmp/nexusserver.img.compressed ./nexusserver.img.compressed
-
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add nexusserver.img.compressed
           git commit -m "Auto-save: $(date '+%Y-%m-%d %H:%M:%S')" || echo "Nothing to commit"
           git push || echo "Push failed"
-
           echo "Done! Next run will use this updated image."
