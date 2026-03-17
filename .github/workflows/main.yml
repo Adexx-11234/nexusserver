@@ -1,0 +1,253 @@
+name: NexusServer 24/7
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM + Check Specs
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -aG kvm $USER
+          ls -la /dev/kvm
+          echo "=== Runner Specs ==="
+          nproc
+          free -h
+          df -h
+          echo "===================="
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            qemu-kvm \
+            cloud-image-utils \
+            genisoimage \
+            openssh-client \
+            sshpass \
+            git-lfs \
+            curl wget screen \
+            net-tools
+
+      - name: Find Free Ports
+        run: |
+          check_port() {
+            ss -tlnp | grep -q ":$1 " && echo "in use" || echo "free"
+          }
+          echo "Port 2222: $(check_port 2222)"
+          echo "Port 8443: $(check_port 8443)"
+          echo "Port 8080: $(check_port 8080)"
+          echo "Port 3000: $(check_port 3000)"
+          echo "Port 2055: $(check_port 2055)"
+
+      - name: Setup Storage
+        run: |
+          sudo mkdir -p /nexusvms
+          sudo mount -t tmpfs -o size=12G tmpfs /nexusvms
+          sudo chmod 777 /nexusvms
+          mkdir -p ~/vms
+          df -h
+
+      - name: Download VM Image from Hugging Face
+        run: |
+          echo "Downloading VM image..."
+          git lfs install
+          git clone https://Paul1212crp:${{ secrets.HF_TOKEN }}@huggingface.co/datasets/Paul1212crp/nexusserver-vm /tmp/nexusserver-vm
+          
+          # Copy directly to vms folder — no decompression needed
+          cp /tmp/nexusserver-vm/nexusserver.img.compressed ~/vms/nexusserver.img
+          
+          echo "Ready: $(du -sh ~/vms/nexusserver.img)"
+          qemu-img info ~/vms/nexusserver.img
+          df -h
+
+      - name: Create Seed ISO
+        run: |
+          cat > /tmp/user-data <<EOF
+          #cloud-config
+          ssh_pwauth: true
+          disable_root: false
+          chpasswd:
+            list: |
+              nexus:${{ secrets.SSH_PASSWORD }}
+              root:${{ secrets.SSH_PASSWORD }}
+            expire: false
+          runcmd:
+            - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+            - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+            - systemctl restart ssh
+          EOF
+
+          cat > /tmp/meta-data <<EOF
+          instance-id: nexusserver-gha
+          local-hostname: nexusserver
+          EOF
+
+          cloud-localds ~/vms/nexusserver-seed.iso \
+            /tmp/user-data /tmp/meta-data
+          echo "Seed ISO created"
+
+      - name: Boot VM
+        run: |
+          sudo chmod 666 /dev/kvm
+
+          # Auto detect RAM and CPU - give VM 80%
+          TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
+          VM_RAM=$(( TOTAL_RAM * 80 / 100 ))
+          CPUS=$(nproc)
+          echo "Total RAM: ${TOTAL_RAM}MB — Giving VM: ${VM_RAM}MB"
+          echo "Total CPUs: ${CPUS} — Giving VM: ${CPUS}"
+
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,mem-merge=off \
+            -m ${VM_RAM} \
+            -smp ${CPUS} \
+            -cpu host,+x2apic \
+            -drive file=$HOME/vms/nexusserver.img,format=qcow2,if=virtio,cache=writeback,discard=unmap,aio=threads \
+            -drive file=$HOME/vms/nexusserver-seed.iso,format=raw,if=virtio \
+            -boot order=c \
+            -device virtio-net-pci,netdev=n0 \
+            -netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8443-:8443,hostfwd=tcp::8080-:8080,hostfwd=tcp::3000-:3000,hostfwd=tcp::2055-:2055 \
+            -object rng-random,filename=/dev/urandom,id=rng0 \
+            -device virtio-rng-pci,rng=rng0 \
+            -device virtio-balloon-pci \
+            -serial file:$HOME/vms/nexusserver.serial.log \
+            -display none \
+            -daemonize \
+            -pidfile $HOME/vms/nexusserver.pid
+          echo "VM booting with ${VM_RAM}MB RAM and ${CPUS} CPUs!"
+
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for VM SSH..."
+          for i in {1..60}; do
+            if ssh -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -o ConnectTimeout=5 \
+                   -p 2222 nexus@localhost \
+                   "echo SSH_READY" 2>/dev/null | grep -q "SSH_READY"; then
+              echo "VM is up after ${i}0 seconds!"
+              break
+            fi
+            echo "Attempt $i/60 - waiting 10s..."
+            sleep 10
+            tail -3 $HOME/vms/nexusserver.serial.log 2>/dev/null || true
+          done
+
+      - name: Connect Tailscale + Start All Services
+        run: |
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              -p 2222 nexus@localhost bash << 'ENDSSH'
+
+          echo "=== System Info ==="
+          free -h
+          nproc
+          df -h /
+
+          echo "=== Connecting Tailscale ==="
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTHKEY }} \
+            --hostname=nexusserver-gha \
+            --accept-routes 2>/dev/null || true
+          sleep 3
+          echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo pending)"
+
+          echo "=== Checking Pelican Config ==="
+          if [[ -f /root/.pelican.env ]] || [[ -f /var/www/pelican/.env ]]; then
+              echo "✅ Pelican config found - starting all services..."
+              BASE_URL="https://raw.githubusercontent.com/Adexx-11234/newrepo/main"
+              curl -fsSL "${BASE_URL}/restart.sh" -o /tmp/nexus-restart.sh
+              sudo bash /tmp/nexus-restart.sh
+              rm -f /tmp/nexus-restart.sh
+          else
+              echo "❌ WARNING: No Pelican config found!"
+              echo "Skipping restart.sh - services will not start"
+              echo "Contents of /root:"
+              ls -la /root/ 2>/dev/null || true
+              echo "Contents of /var/www:"
+              ls -la /var/www/ 2>/dev/null || true
+          fi
+
+          echo "=== Services Status ==="
+          sudo systemctl is-active wings nginx php8.3-fpm cloudflared 2>/dev/null || true
+          echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo not connected)"
+
+          ENDSSH
+
+      - name: Keep Alive + Save Before Restart
+        run: |
+          echo "Server running! Keeping alive for 4.5 hours..."
+          START=$(date +%s)
+
+          for i in {1..27}; do
+            sleep 600
+            ELAPSED=$(( ($(date +%s) - START) / 60 ))
+            echo "[$i/27] Running ${ELAPSED} mins - $(date '+%H:%M:%S')"
+
+            sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "echo OK && sudo systemctl is-active wings nginx 2>/dev/null && tailscale ip -4 2>/dev/null" \
+            2>/dev/null || echo "Health check failed at $i"
+          done
+
+          echo "=== 4.5 hours complete — saving VM ==="
+
+          # Graceful shutdown
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 nexus@localhost \
+              "sudo shutdown -h now" 2>/dev/null || true
+
+          echo "Waiting for shutdown..."
+          sleep 40
+
+          # Force kill if still running
+          kill $(cat $HOME/vms/nexusserver.pid 2>/dev/null) 2>/dev/null || true
+          sleep 5
+
+          # Compress and save
+          echo "Compressing updated image..."
+          df -h
+          cp $HOME/vms/nexusserver.img /nexusvms/nexusserver.img
+          qemu-img convert -O qcow2 -c \
+            /nexusvms/nexusserver.img \
+            /nexusvms/nexusserver.img.compressed
+          rm -f /nexusvms/nexusserver.img
+          echo "Compressed: $(du -sh /nexusvms/nexusserver.img.compressed)"
+
+      - name: Upload Updated Image to Hugging Face
+        run: |
+          echo "Uploading updated image..."
+          cd /tmp/nexusserver-vm
+
+          cp /nexusvms/nexusserver.img.compressed ./nexusserver.img.compressed
+
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add nexusserver.img.compressed
+          git commit -m "Auto-save: $(date '+%Y-%m-%d %H:%M:%S')" || echo "Nothing to commit"
+          git push || echo "Push failed"
+
+          echo "Done! Next run will use this updated image."
