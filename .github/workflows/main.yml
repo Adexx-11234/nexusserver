@@ -55,9 +55,6 @@ jobs:
 
       - name: Setup Storage
         run: |
-          sudo mkdir -p /nexusvms
-          sudo mount -t tmpfs -o size=12G tmpfs /nexusvms
-          sudo chmod 777 /nexusvms
           mkdir -p ~/vms
           df -h
 
@@ -66,10 +63,10 @@ jobs:
           echo "Downloading VM image..."
           git lfs install
           git clone https://Paul1212crp:${{ secrets.HF_TOKEN }}@huggingface.co/datasets/Paul1212crp/nexusserver-vm /tmp/nexusserver-vm
-          
-          # Copy directly to vms folder — no decompression needed
+
+          # Copy directly to vms on main disk - 91G free, no decompression needed
           cp /tmp/nexusserver-vm/nexusserver.img.compressed ~/vms/nexusserver.img
-          
+
           echo "Ready: $(du -sh ~/vms/nexusserver.img)"
           qemu-img info ~/vms/nexusserver.img
           df -h
@@ -104,9 +101,9 @@ jobs:
         run: |
           sudo chmod 666 /dev/kvm
 
-          # Auto detect RAM and CPU - give VM 80%
+          # Auto detect RAM and CPU - give VM 85%
           TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
-          VM_RAM=$(( TOTAL_RAM * 80 / 100 ))
+          VM_RAM=$(( TOTAL_RAM * 85 / 100 ))
           CPUS=$(nproc)
           echo "Total RAM: ${TOTAL_RAM}MB — Giving VM: ${VM_RAM}MB"
           echo "Total CPUs: ${CPUS} — Giving VM: ${CPUS}"
@@ -227,22 +224,20 @@ jobs:
           kill $(cat $HOME/vms/nexusserver.pid 2>/dev/null) 2>/dev/null || true
           sleep 5
 
-          # Compress and save
+          # Compress directly on main disk
           echo "Compressing updated image..."
           df -h
-          cp $HOME/vms/nexusserver.img /nexusvms/nexusserver.img
           qemu-img convert -O qcow2 -c \
-            /nexusvms/nexusserver.img \
-            /nexusvms/nexusserver.img.compressed
-          rm -f /nexusvms/nexusserver.img
-          echo "Compressed: $(du -sh /nexusvms/nexusserver.img.compressed)"
+            $HOME/vms/nexusserver.img \
+            /tmp/nexusserver.img.compressed
+          echo "Compressed: $(du -sh /tmp/nexusserver.img.compressed)"
 
       - name: Upload Updated Image to Hugging Face
         run: |
           echo "Uploading updated image..."
           cd /tmp/nexusserver-vm
 
-          cp /nexusvms/nexusserver.img.compressed ./nexusserver.img.compressed
+          cp /tmp/nexusserver.img.compressed ./nexusserver.img.compressed
 
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
