@@ -303,7 +303,7 @@ jobs:
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup sudo rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --transfers 32 --checkers 16 --dropbox-batch-mode async --dropbox-batch-size 100 --dropbox-batch-timeout 15s --buffer-size 256M --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available - skipping Dropbox'" \
+              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup sudo rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --transfers 32 --checkers 16 --dropbox-batch-mode async --dropbox-batch-size 100 --dropbox-batch-timeout 5s --buffer-size 256M --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available - skipping Dropbox'" \
           2>/dev/null || true
 
           # 3. Pause VM, copy image, resume immediately
