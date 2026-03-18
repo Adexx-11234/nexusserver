@@ -3,7 +3,12 @@ name: NexusServer 24/7
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 */5 * * *'
+
+# Prevent overlapping runs - cancel queued runs if one is already in progress
+concurrency:
+  group: nexusserver-singleton
+  cancel-in-progress: false
 
 jobs:
   run-server:
@@ -290,13 +295,14 @@ jobs:
               "sudo sync" 2>/dev/null || true
 
           echo "Pausing VM..."
-          echo "stop" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          printf 'stop\n' | socat -u STDIN UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          sleep 2
 
           echo "Copying VM image..."
           cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
           echo "Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
 
-          echo "cont" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          printf 'cont\n' | socat -u STDIN UNIX-CONNECT:$HOME/vms/nexusserver.monitor
           echo "VM RESUMED!"
 
           sshpass -p "$SSH_PASS" \
