@@ -1,40 +1,12 @@
 name: NexusServer 24/7
 
 on:
-  # Manual trigger - use this to START the chain for the very first time
+  # Manual trigger only - the workflow re-triggers itself at the end via API
+  # Just click "Run workflow" ONCE and it will chain forever automatically
   workflow_dispatch:
-  # Self-trigger - fires only after this same workflow completes
-  # Guarantees a new run NEVER starts until HuggingFace upload is fully done
-  workflow_run:
-    workflows: ["NexusServer 24/7"]
-    types:
-      - completed
 
 jobs:
-  # Gate job: only continue if previous run succeeded (prevents failure loops)
-  check-previous:
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-    steps:
-      - name: Check if previous run succeeded
-        id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "Manual trigger - starting chain!"
-          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "Previous run succeeded - continuing chain!"
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "Previous run did NOT succeed (was: ${{ github.event.workflow_run.conclusion }})"
-            echo "Chain stopped. Fix the issue then manually trigger via workflow_dispatch."
-          fi
-
   run-server:
-    needs: check-previous
-    if: needs.check-previous.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
@@ -396,10 +368,14 @@ jobs:
           echo "Done! Next run will boot from this updated image."
 
       - name: Trigger Next Run
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          echo "Upload confirmed complete - triggering next run now..."
+          echo "HuggingFace upload done - triggering next run..."
           curl -s -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" \
-            -d '{"ref":"main"}' && echo "Next run triggered!" || echo "Trigger failed - workflow_run will handle it"
+            -d '{"ref":"main"}' \
+          && echo "✅ Next run triggered successfully!" \
+          || echo "❌ Trigger failed - manually run workflow_dispatch to restart chain"
