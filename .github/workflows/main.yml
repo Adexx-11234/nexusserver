@@ -55,13 +55,11 @@ jobs:
       - name: Boot VM
         run: |
           sudo chmod 666 /dev/kvm
-
           TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
           VM_RAM=$(( TOTAL_RAM * 85 / 100 ))
           CPUS=$(nproc)
           echo "Total RAM: ${TOTAL_RAM}MB — Giving VM: ${VM_RAM}MB"
           echo "Total CPUs: ${CPUS} — Giving VM: ${CPUS}"
-
           qemu-system-x86_64 \
             -enable-kvm \
             -machine q35,mem-merge=off \
@@ -100,6 +98,21 @@ jobs:
             tail -3 $HOME/vms/nexusserver.serial.log 2>/dev/null || true
           done
 
+      - name: Setup sshx Service
+        run: |
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              -p 2222 nexus@localhost \
+              'sudo systemctl stop sshx 2>/dev/null || true
+               sudo systemctl disable sshx 2>/dev/null || true
+               printf "[Unit]\nDescription=sshx terminal sharing\nAfter=network.target\n\n[Service]\nType=simple\nUser=nexus\nGroup=nexus\nExecStartPre=/bin/bash -c '"'"'pkill -9 sshx || true; sleep 1'"'"'\nExecStart=/usr/local/bin/sshx\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n" | sudo tee /etc/systemd/system/sshx.service > /dev/null
+               sudo systemctl daemon-reload
+               sudo systemctl enable sshx
+               sudo systemctl restart sshx
+               echo "sshx service started"'
+
       - name: Setup VM + Restore Dropbox + Start Services
         run: |
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
@@ -120,9 +133,9 @@ jobs:
           echo "=== Installing rclone if missing ==="
           if ! command -v rclone &>/dev/null; then
             curl https://rclone.org/install.sh | sudo bash 2>/dev/null
-            echo "✅ rclone installed"
+            echo "rclone installed"
           else
-            echo "✅ rclone already installed"
+            echo "rclone already installed"
           fi
 
           echo "=== Checking Dropbox ==="
@@ -130,7 +143,7 @@ jobs:
             FILE_COUNT=$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
             echo "Files in Dropbox: $FILE_COUNT"
             if [[ "$FILE_COUNT" -gt 0 ]]; then
-              echo "✅ Restoring from Dropbox..."
+              echo "Restoring from Dropbox..."
               sudo systemctl stop wings 2>/dev/null || true
               sleep 2
               rclone sync backup:nexus-volumes /var/lib/pelican/volumes \
@@ -140,16 +153,16 @@ jobs:
                 --exclude ".npm/**" \
                 --exclude "*.log" \
                 2>&1 | tail -3
-              echo "✅ Restored! Clearing Dropbox..."
+              echo "Restored! Clearing Dropbox..."
               rclone delete backup:nexus-volumes 2>/dev/null || true
               rclone rmdir backup:nexus-volumes 2>/dev/null || true
               rclone mkdir backup:nexus-volumes 2>/dev/null || true
-              echo "✅ Dropbox cleared!"
+              echo "Dropbox cleared!"
             else
-              echo "✅ Dropbox empty — using VM image"
+              echo "Dropbox empty — using VM image"
             fi
           else
-            echo "⚠️ rclone not configured"
+            echo "rclone not configured"
           fi
 
           echo "=== Connecting Tailscale ==="
@@ -160,42 +173,15 @@ jobs:
           sleep 3
           echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo pending)"
 
-          echo "=== Setting up sshx as service ==="
-          sudo systemctl stop sshx 2>/dev/null || true
-          sudo systemctl disable sshx 2>/dev/null || true
-          sudo tee /etc/systemd/system/sshx.service > /dev/null <<'SF'
-[Unit]
-Description=sshx terminal sharing
-After=network.target
-
-[Service]
-Type=simple
-User=nexus
-Group=nexus
-ExecStartPre=/bin/bash -c 'pkill -9 sshx || true; sleep 1'
-ExecStart=/usr/local/bin/sshx
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-SF
-          sudo systemctl daemon-reload
-          sudo systemctl enable sshx
-          sudo systemctl restart sshx
-          sleep 5
-          SSHX_LINK=$(sudo journalctl -u sshx -n 10 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1)
-          echo "sshx: $SSHX_LINK"
-
           echo "=== Checking Pelican Config ==="
           if [[ -f /root/.pelican.env ]] || [[ -f /var/www/pelican/.env ]]; then
-            echo "✅ Pelican config found - starting all services..."
+            echo "Pelican config found - starting all services..."
             BASE_URL="https://raw.githubusercontent.com/Adexx-11234/newrepo/main"
             curl -fsSL "${BASE_URL}/restart.sh" -o /tmp/nexus-restart.sh
             sudo bash /tmp/nexus-restart.sh
             rm -f /tmp/nexus-restart.sh
           else
-            echo "❌ WARNING: No Pelican config found!"
+            echo "WARNING: No Pelican config found!"
           fi
 
           echo "=== Final Nginx Check ==="
@@ -207,9 +193,9 @@ SF
 
           ENDSSH
 
-      - name: 🎉 Show Access Details
+      - name: Show Access Details
         run: |
-          sleep 10
+          sleep 15
 
           TAILSCALE_IP=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
             ssh -o StrictHostKeyChecking=no \
@@ -223,7 +209,7 @@ SF
                 -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=10 \
                 -p 2222 nexus@localhost \
-                "sudo journalctl -u sshx -n 10 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1 || echo 'not ready yet'" 2>/dev/null)
+                "sudo journalctl -u sshx -n 20 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1 || echo 'not ready'" 2>/dev/null)
 
           PUBLIC_IP=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
             ssh -o StrictHostKeyChecking=no \
@@ -237,29 +223,21 @@ SF
           echo "║       🎉 NEXUSSERVER IS LIVE!                    ║"
           echo "║          Created by NexusTechPro               ║"
           echo "╠══════════════════════════════════════════════════╣"
-          echo "║                                                  ║"
           echo "║  👤  Username:     nexus                         ║"
           echo "║  🔑  Password:     ${{ secrets.SSH_PASSWORD }}"
           echo "║  🌐  Public IP:    ${PUBLIC_IP}"
           echo "║  🔒  Tailscale IP: ${TAILSCALE_IP}"
-          echo "║                                                  ║"
           echo "╠══════════════════════════════════════════════════╣"
           echo "║  🌐  Panel:   https://panel.nexusbot.qzz.io      ║"
           echo "║  🌐  Wings:   https://node-1.nexusbot.qzz.io     ║"
-          echo "║                                                  ║"
           echo "╠══════════════════════════════════════════════════╣"
           echo "║  🔗  CLICK LINK BELOW TO ACCESS YOUR TERMINAL:  ║"
-          echo "║                                                  ║"
           echo "     👉  ${SSHX_LINK}"
-          echo "║                                                  ║"
           echo "╠══════════════════════════════════════════════════╣"
-          echo "║  🔐  SSH Access (via Tailscale):                 ║"
           echo "║  ssh nexus@${TAILSCALE_IP}                       ║"
-          echo "║                                                  ║"
           echo "║  ⏰  VM runs for 4.5 hours then auto-restarts    ║"
           echo "║  💾  Smart Dropbox sync on restart               ║"
           echo "╚══════════════════════════════════════════════════╝"
-          echo ""
           echo "✅ SERVER IS LIVE! Click the sshx link above!"
 
       - name: Keep Alive + Smart Backup
@@ -271,7 +249,6 @@ SF
             sleep 600
             ELAPSED=$(( ($(date +%s) - START) / 60 ))
             echo "[$i/27] Running ${ELAPSED} mins - $(date '+%H:%M:%S')"
-
             sshpass -p "${{ secrets.SSH_PASSWORD }}" \
             ssh -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
@@ -295,14 +272,14 @@ SF
           echo "Pausing VM..."
           echo "stop" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
 
-          # Copy image
+          # Copy image while paused
           echo "Copying VM image..."
           cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
-          echo "✅ Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
+          echo "Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
 
           # Resume VM immediately
           echo "cont" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
-          echo "✅ VM RESUMED!"
+          echo "VM RESUMED!"
 
           # Start Dropbox sync in background
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
@@ -325,12 +302,12 @@ SF
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "pkill -f 'rclone sync' 2>/dev/null || true && echo 'Dropbox files: '$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)" \
+              "pkill -f 'rclone sync' 2>/dev/null || true && echo 'Dropbox files synced: '$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)" \
           2>/dev/null || true
 
           # Cleanup
           rm -f $HOME/vms/nexusserver.snapshot.img
-          echo "✅ Done: $(du -sh /tmp/nexusserver.img.compressed)"
+          echo "Done: $(du -sh /tmp/nexusserver.img.compressed)"
 
       - name: Upload Updated Image to Hugging Face
         run: |
