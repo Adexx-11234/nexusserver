@@ -3,7 +3,7 @@ name: NexusServer 24/7
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'  # Every hour
+    - cron: '0 * * * *'
 
 jobs:
   run-server:
@@ -115,8 +115,7 @@ jobs:
 
           echo "=== Fixing Nginx ==="
           sudo sed -i '/# Disable caching for Livewire/,/^}/d' /etc/nginx/sites-available/pelican.conf 2>/dev/null || true
-          sudo nginx -t 2>/dev/null && sudo systemctl restart nginx || true
-          sudo systemctl is-active nginx && echo "✅ Nginx running" || echo "❌ Nginx failed"
+          sudo nginx -t 2>/dev/null && sudo systemctl restart nginx 2>/dev/null || true
 
           echo "=== Installing rclone if missing ==="
           if ! command -v rclone &>/dev/null; then
@@ -126,18 +125,14 @@ jobs:
             echo "✅ rclone already installed"
           fi
 
-          echo "=== Checking Dropbox Config ==="
-          if ! rclone listremotes 2>/dev/null | grep -q "backup:"; then
-            echo "⚠️ rclone not configured — skipping restore"
-          else
+          echo "=== Checking Dropbox ==="
+          if rclone listremotes 2>/dev/null | grep -q "backup:"; then
             FILE_COUNT=$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
             echo "Files in Dropbox: $FILE_COUNT"
-
             if [[ "$FILE_COUNT" -gt 0 ]]; then
-              echo "✅ Restoring $FILE_COUNT files from Dropbox..."
+              echo "✅ Restoring from Dropbox..."
               sudo systemctl stop wings 2>/dev/null || true
               sleep 2
-
               rclone sync backup:nexus-volumes /var/lib/pelican/volumes \
                 --copy-links \
                 --exclude "node_modules/**" \
@@ -145,15 +140,16 @@ jobs:
                 --exclude ".npm/**" \
                 --exclude "*.log" \
                 2>&1 | tail -3
-
-              echo "✅ Dropbox restored!"
+              echo "✅ Restored! Clearing Dropbox..."
               rclone delete backup:nexus-volumes 2>/dev/null || true
               rclone rmdir backup:nexus-volumes 2>/dev/null || true
               rclone mkdir backup:nexus-volumes 2>/dev/null || true
-              echo "✅ Dropbox cleared for next cycle!"
+              echo "✅ Dropbox cleared!"
             else
-              echo "✅ Dropbox empty — using VM image files"
+              echo "✅ Dropbox empty — using VM image"
             fi
+          else
+            echo "⚠️ rclone not configured"
           fi
 
           echo "=== Connecting Tailscale ==="
@@ -164,23 +160,42 @@ jobs:
           sleep 3
           echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo pending)"
 
-          echo "=== Starting sshx ==="
-          pkill sshx 2>/dev/null || true
-          nohup sshx > /tmp/sshx.log 2>&1 &
+          echo "=== Setting up sshx as service ==="
+          sudo systemctl stop sshx 2>/dev/null || true
+          sudo systemctl disable sshx 2>/dev/null || true
+          sudo tee /etc/systemd/system/sshx.service > /dev/null <<'SF'
+[Unit]
+Description=sshx terminal sharing
+After=network.target
+
+[Service]
+Type=simple
+User=nexus
+Group=nexus
+ExecStartPre=/bin/bash -c 'pkill -9 sshx || true; sleep 1'
+ExecStart=/usr/local/bin/sshx
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SF
+          sudo systemctl daemon-reload
+          sudo systemctl enable sshx
+          sudo systemctl restart sshx
           sleep 5
-          SSHX_LINK=$(grep -o 'https://sshx.io/s/[^ #]*' /tmp/sshx.log 2>/dev/null | tail -1 || echo "starting...")
-          echo "sshx link: $SSHX_LINK"
+          SSHX_LINK=$(sudo journalctl -u sshx -n 10 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1)
+          echo "sshx: $SSHX_LINK"
 
           echo "=== Checking Pelican Config ==="
           if [[ -f /root/.pelican.env ]] || [[ -f /var/www/pelican/.env ]]; then
-              echo "✅ Pelican config found - starting all services..."
-              BASE_URL="https://raw.githubusercontent.com/Adexx-11234/newrepo/main"
-              curl -fsSL "${BASE_URL}/restart.sh" -o /tmp/nexus-restart.sh
-              sudo bash /tmp/nexus-restart.sh
-              rm -f /tmp/nexus-restart.sh
+            echo "✅ Pelican config found - starting all services..."
+            BASE_URL="https://raw.githubusercontent.com/Adexx-11234/newrepo/main"
+            curl -fsSL "${BASE_URL}/restart.sh" -o /tmp/nexus-restart.sh
+            sudo bash /tmp/nexus-restart.sh
+            rm -f /tmp/nexus-restart.sh
           else
-              echo "❌ WARNING: No Pelican config found!"
-              ls -la /root/ 2>/dev/null || true
+            echo "❌ WARNING: No Pelican config found!"
           fi
 
           echo "=== Final Nginx Check ==="
@@ -208,7 +223,7 @@ jobs:
                 -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=10 \
                 -p 2222 nexus@localhost \
-                "grep -o 'https://sshx.io/s/[^ #]*' /tmp/sshx.log 2>/dev/null | tail -1 || echo 'not ready yet'" 2>/dev/null)
+                "sudo journalctl -u sshx -n 10 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1 || echo 'not ready yet'" 2>/dev/null)
 
           PUBLIC_IP=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
             ssh -o StrictHostKeyChecking=no \
@@ -268,7 +283,7 @@ jobs:
 
           echo "=== 4.5 hours complete — Smart backup ==="
 
-          # Step 1 — Flush VM writes
+          # Flush VM writes
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
@@ -276,45 +291,44 @@ jobs:
               -p 2222 nexus@localhost \
               "sudo sync" 2>/dev/null || true
 
-          # Step 2 — Pause VM
+          # Pause VM
           echo "Pausing VM..."
           echo "stop" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
 
-          # Step 3 — Copy image (VM stays paused until copy done)
+          # Copy image
           echo "Copying VM image..."
           cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
           echo "✅ Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
 
-          # Step 4 — Resume VM immediately
+          # Resume VM immediately
           echo "cont" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
           echo "✅ VM RESUMED!"
 
-          # Step 5 — Start Dropbox sync in background
+          # Start Dropbox sync in background
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "command -v rclone &>/dev/null && nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available'" \
+              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available'" \
           2>/dev/null || true
 
-          # Step 6 — Compress snapshot (VM running normally)
+          # Compress snapshot
           echo "Compressing snapshot..."
           qemu-img convert -O qcow2 -c \
             $HOME/vms/nexusserver.snapshot.img \
             /tmp/nexusserver.img.compressed
 
-          # Step 7 — Stop Dropbox sync
+          # Stop Dropbox sync
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "pkill -f 'rclone sync' 2>/dev/null || true
-               echo 'Dropbox files synced: '$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)" \
+              "pkill -f 'rclone sync' 2>/dev/null || true && echo 'Dropbox files: '$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)" \
           2>/dev/null || true
 
-          # Step 8 — Cleanup
+          # Cleanup
           rm -f $HOME/vms/nexusserver.snapshot.img
           echo "✅ Done: $(du -sh /tmp/nexusserver.img.compressed)"
 
