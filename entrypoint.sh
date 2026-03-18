@@ -7,7 +7,7 @@
 #    SSH_PASSWORD      - Password for nexus VM user
 #    TAILSCALE_AUTHKEY - Tailscale auth key
 # ============================================================
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
@@ -44,23 +44,16 @@ fi
 section "Download VM Image from Hugging Face"
 # ─────────────────────────────────────────────────────────────────────────────
 mkdir -p /vms
-info "Downloading VM image..."
+info "Downloading VM image via curl..."
+HF_URL="https://huggingface.co/datasets/Paul1212crp/nexusserver-vm/resolve/main/nexusserver.img.compressed"
+curl -L \
+    -H "Authorization: Bearer ${HF_TOKEN}" \
+    -o /vms/nexusserver.img \
+    --progress-bar \
+    --retry 3 \
+    --retry-delay 5 \
+    "${HF_URL}"
 
-python3 - <<'PYEOF'
-import os
-from huggingface_hub import hf_hub_download
-path = hf_hub_download(
-    repo_id="Paul1212crp/nexusserver-vm",
-    filename="nexusserver.img.compressed",
-    repo_type="dataset",
-    token=os.environ["HF_TOKEN"],
-    local_dir="/tmp"
-)
-print("Downloaded to:", path)
-PYEOF
-
-cp /tmp/nexusserver.img.compressed /vms/nexusserver.img
-rm -f /tmp/nexusserver.img.compressed
 info "Image ready: $(du -sh /vms/nexusserver.img)"
 qemu-img info /vms/nexusserver.img
 
