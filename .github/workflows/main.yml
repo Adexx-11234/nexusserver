@@ -3,7 +3,7 @@ name: NexusServer 24/7
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 * * * *'  # Every hour
 
 jobs:
   run-server:
@@ -38,7 +38,8 @@ jobs:
             sshpass \
             git-lfs \
             curl wget \
-            net-tools
+            net-tools \
+            socat
 
       - name: Download VM Image from Hugging Face
         run: |
@@ -75,6 +76,7 @@ jobs:
             -device virtio-rng-pci,rng=rng0 \
             -device virtio-balloon-pci \
             -serial file:$HOME/vms/nexusserver.serial.log \
+            -monitor unix:$HOME/vms/nexusserver.monitor,server,nowait \
             -display none \
             -daemonize \
             -pidfile $HOME/vms/nexusserver.pid
@@ -119,6 +121,13 @@ jobs:
           sleep 3
           echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo pending)"
 
+          echo "=== Starting sshx ==="
+          pkill sshx 2>/dev/null || true
+          nohup sshx > /tmp/sshx.log 2>&1 &
+          sleep 5
+          SSHX_LINK=$(grep -o 'https://sshx.io/s/[^ #]*' /tmp/sshx.log 2>/dev/null | tail -1 || echo "starting...")
+          echo "sshx link: $SSHX_LINK"
+
           echo "=== Checking Pelican Config ==="
           if [[ -f /root/.pelican.env ]] || [[ -f /var/www/pelican/.env ]]; then
               echo "✅ Pelican config found - starting all services..."
@@ -140,7 +149,62 @@ jobs:
 
           ENDSSH
 
-      - name: Keep Alive + Save Before Restart
+      - name: 🎉 Show Access Details
+        run: |
+          sleep 10
+
+          TAILSCALE_IP=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "tailscale ip -4 2>/dev/null || echo pending" 2>/dev/null)
+
+          SSHX_LINK=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "grep -o 'https://sshx.io/s/[^ #]*' /tmp/sshx.log 2>/dev/null | tail -1 || echo 'not ready yet'" 2>/dev/null)
+
+          PUBLIC_IP=$(sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "curl -s ifconfig.me 2>/dev/null" 2>/dev/null)
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║       🎉 NEXUSSERVER IS LIVE!                    ║"
+          echo "║          Created by NexusTechPro               ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║                                                  ║"
+          echo "║  👤  Username:     nexus                         ║"
+          echo "║  🔑  Password:     ${{ secrets.SSH_PASSWORD }}"
+          echo "║  🌐  Public IP:    ${PUBLIC_IP}"
+          echo "║  🔒  Tailscale IP: ${TAILSCALE_IP}"
+          echo "║                                                  ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  🌐  Panel:   https://panel.nexusbot.qzz.io      ║"
+          echo "║  🌐  Wings:   https://node-1.nexusbot.qzz.io     ║"
+          echo "║                                                  ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  🔗  CLICK LINK BELOW TO ACCESS YOUR TERMINAL:  ║"
+          echo "║                                                  ║"
+          echo "     👉  ${SSHX_LINK}"
+          echo "║                                                  ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║  🔐  SSH Access (via Tailscale):                 ║"
+          echo "║  ssh nexus@${TAILSCALE_IP}                       ║"
+          echo "║                                                  ║"
+          echo "║  ⏰  VM runs for 4.5 hours then auto-restarts    ║"
+          echo "║  💾  Backup saved to Hugging Face automatically  ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+          echo "✅ SERVER IS LIVE! Click the sshx link above!"
+
+      - name: Keep Alive + True Zero Downtime Backup
         run: |
           echo "Server running! Keeping alive for 4.5 hours..."
           START=$(date +%s)
@@ -159,27 +223,46 @@ jobs:
             2>/dev/null || echo "Health check failed at $i"
           done
 
-          echo "=== 4.5 hours complete — saving VM ==="
+          echo "=== 4.5 hours complete — true zero downtime backup ==="
 
-          # Graceful shutdown
+          # Step 1 — Flush all pending VM writes
+          echo "Step 1: Flushing VM writes..."
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "sudo shutdown -h now" 2>/dev/null || true
+              "sudo sync" 2>/dev/null || true
+          echo "✅ Writes flushed"
 
-          echo "Waiting for shutdown..."
-          sleep 40
+          # Step 2 — Pause VM via QEMU monitor
+          echo "Step 2: Pausing VM..."
+          echo "stop" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          echo "✅ VM paused"
 
-          kill $(cat $HOME/vms/nexusserver.pid 2>/dev/null) 2>/dev/null || true
-          sleep 5
+          # Step 3 — Copy image file (VM stays paused until copy is 100% done)
+          # No timer — cp runs until fully complete then VM resumes
+          echo "Step 3: Copying image (VM paused until done)..."
+          cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
+          echo "✅ Copy complete: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
 
-          echo "Compressing updated image..."
+          # Step 4 — Resume VM IMMEDIATELY after copy finishes
+          echo "Step 4: Resuming VM..."
+          echo "cont" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          echo "✅ VM RESUMED! Snapshot copy complete!"
+
+          # Step 5 — Compress snapshot (VM is running normally now)
+          echo "Step 5: Compressing snapshot (VM running normally)..."
           qemu-img convert -O qcow2 -c \
-            $HOME/vms/nexusserver.img \
+            $HOME/vms/nexusserver.snapshot.img \
             /tmp/nexusserver.img.compressed
-          echo "Compressed: $(du -sh /tmp/nexusserver.img.compressed)"
+          echo "✅ Compressed: $(du -sh /tmp/nexusserver.img.compressed)"
+
+          # Step 6 — Delete snapshot copy to free disk space
+          echo "Step 6: Cleaning up snapshot copy..."
+          rm -f $HOME/vms/nexusserver.snapshot.img
+          echo "✅ Cleanup done"
+          echo "✅ VM was running during entire compression and upload!"
 
       - name: Upload Updated Image to Hugging Face
         run: |
