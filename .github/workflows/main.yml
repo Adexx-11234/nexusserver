@@ -1,4 +1,3 @@
-
 name: NexusServer 24/7
 
 on:
@@ -101,7 +100,7 @@ jobs:
             tail -3 $HOME/vms/nexusserver.serial.log 2>/dev/null || true
           done
 
-      - name: Restore from Dropbox + Start All Services
+      - name: Setup VM + Restore Dropbox + Start Services
         run: |
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
@@ -114,13 +113,28 @@ jobs:
           nproc
           df -h /
 
-          echo "=== Checking Dropbox for new files ==="
-          if command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q "backup:"; then
+          echo "=== Fixing Nginx ==="
+          sudo sed -i '/# Disable caching for Livewire/,/^}/d' /etc/nginx/sites-available/pelican.conf 2>/dev/null || true
+          sudo nginx -t 2>/dev/null && sudo systemctl restart nginx || true
+          sudo systemctl is-active nginx && echo "✅ Nginx running" || echo "❌ Nginx failed"
+
+          echo "=== Installing rclone if missing ==="
+          if ! command -v rclone &>/dev/null; then
+            curl https://rclone.org/install.sh | sudo bash 2>/dev/null
+            echo "✅ rclone installed"
+          else
+            echo "✅ rclone already installed"
+          fi
+
+          echo "=== Checking Dropbox Config ==="
+          if ! rclone listremotes 2>/dev/null | grep -q "backup:"; then
+            echo "⚠️ rclone not configured — skipping restore"
+          else
             FILE_COUNT=$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
             echo "Files in Dropbox: $FILE_COUNT"
 
             if [[ "$FILE_COUNT" -gt 0 ]]; then
-              echo "✅ Found $FILE_COUNT new files in Dropbox — restoring..."
+              echo "✅ Restoring $FILE_COUNT files from Dropbox..."
               sudo systemctl stop wings 2>/dev/null || true
               sleep 2
 
@@ -132,23 +146,15 @@ jobs:
                 --exclude "*.log" \
                 2>&1 | tail -3
 
-              echo "✅ Dropbox files restored!"
-
-              echo "Clearing Dropbox for next cycle..."
+              echo "✅ Dropbox restored!"
               rclone delete backup:nexus-volumes 2>/dev/null || true
               rclone rmdir backup:nexus-volumes 2>/dev/null || true
               rclone mkdir backup:nexus-volumes 2>/dev/null || true
-              echo "✅ Dropbox cleared!"
+              echo "✅ Dropbox cleared for next cycle!"
             else
-              echo "✅ Dropbox is empty — using VM image files as-is"
+              echo "✅ Dropbox empty — using VM image files"
             fi
-          else
-            echo "⚠️ rclone not configured — using VM image files"
           fi
-
-          echo "=== Fixing Nginx ==="
-          sed -i '/# Disable caching for Livewire/,/^}/d' /etc/nginx/sites-available/pelican.conf 2>/dev/null || true
-          nginx -t && systemctl restart nginx || true
 
           echo "=== Connecting Tailscale ==="
           sudo tailscale up \
@@ -175,8 +181,10 @@ jobs:
           else
               echo "❌ WARNING: No Pelican config found!"
               ls -la /root/ 2>/dev/null || true
-              ls -la /var/www/ 2>/dev/null || true
           fi
+
+          echo "=== Final Nginx Check ==="
+          sudo nginx -t 2>/dev/null && sudo systemctl restart nginx 2>/dev/null || true
 
           echo "=== Services Status ==="
           sudo systemctl is-active wings nginx php8.3-fpm cloudflared 2>/dev/null || true
@@ -258,10 +266,9 @@ jobs:
             2>/dev/null || echo "Health check failed at $i"
           done
 
-          echo "=== 4.5 hours complete — Smart backup starting ==="
+          echo "=== 4.5 hours complete — Smart backup ==="
 
           # Step 1 — Flush VM writes
-          echo "Step 1: Flushing VM writes..."
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
@@ -270,65 +277,57 @@ jobs:
               "sudo sync" 2>/dev/null || true
 
           # Step 2 — Pause VM
-          echo "Step 2: Pausing VM..."
+          echo "Pausing VM..."
           echo "stop" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
 
-          # Step 3 — Copy image (VM stays paused until done)
-          echo "Step 3: Copying VM image..."
+          # Step 3 — Copy image (VM stays paused until copy done)
+          echo "Copying VM image..."
           cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
           echo "✅ Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
 
           # Step 4 — Resume VM immediately
-          echo "Step 4: Resuming VM..."
           echo "cont" | socat - UNIX-CONNECT:$HOME/vms/nexusserver.monitor
           echo "✅ VM RESUMED!"
 
-          # Step 5 — Start Dropbox sync of NEW files in background
-          echo "Step 5: Starting Dropbox sync of new files..."
+          # Step 5 — Start Dropbox sync in background
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 &
-               echo 'Dropbox sync started'" \
+              "command -v rclone &>/dev/null && nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available'" \
           2>/dev/null || true
 
-          # Step 6 — Compress snapshot (VM running + Dropbox syncing)
-          echo "Step 6: Compressing VM snapshot..."
+          # Step 6 — Compress snapshot (VM running normally)
+          echo "Compressing snapshot..."
           qemu-img convert -O qcow2 -c \
             $HOME/vms/nexusserver.snapshot.img \
             /tmp/nexusserver.img.compressed
 
           # Step 7 — Stop Dropbox sync
-          echo "Step 7: Stopping Dropbox sync..."
           sshpass -p "${{ secrets.SSH_PASSWORD }}" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
               "pkill -f 'rclone sync' 2>/dev/null || true
-               echo 'Dropbox sync stopped'
-               echo 'Files synced:'
-               rclone ls backup:nexus-volumes 2>/dev/null | wc -l" \
+               echo 'Dropbox files synced: '$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)" \
           2>/dev/null || true
 
           # Step 8 — Cleanup
           rm -f $HOME/vms/nexusserver.snapshot.img
-          echo "✅ Snapshot: $(du -sh /tmp/nexusserver.img.compressed)"
+          echo "✅ Done: $(du -sh /tmp/nexusserver.img.compressed)"
 
       - name: Upload Updated Image to Hugging Face
         run: |
           echo "Uploading updated image..."
           cd /tmp/nexusserver-vm
 
-          # Enable large file support on HF repo
-          echo "Enabling large file support..."
+          # Enable large file support
           curl -s -X POST \
             "https://huggingface.co/api/datasets/Paul1212crp/nexusserver-vm/lfs-enable-largefiles" \
             -H "Authorization: Bearer ${{ secrets.HF_TOKEN }}" || true
 
-          # Setup git lfs
           git lfs install
           git lfs track "*.compressed"
 
