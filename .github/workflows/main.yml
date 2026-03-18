@@ -157,23 +157,29 @@ jobs:
 
             echo "=== Checking Dropbox ==="
             if rclone listremotes 2>/dev/null | grep -q "backup:"; then
-              FILE_COUNT=$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
+              FILE_COUNT=$(sudo rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
               echo "Files in Dropbox: $FILE_COUNT"
               if [[ "$FILE_COUNT" -gt 0 ]]; then
                 echo "Restoring from Dropbox..."
                 sudo systemctl stop wings 2>/dev/null || true
                 sleep 2
-                rclone sync backup:nexus-volumes /var/lib/pelican/volumes \
+                sudo rclone sync backup:nexus-volumes /var/lib/pelican/volumes \
                   --copy-links \
                   --exclude "node_modules/**" \
                   --exclude ".git/**" \
                   --exclude ".npm/**" \
                   --exclude "*.log" \
+                  --transfers 32 \
+                  --checkers 16 \
+                  --dropbox-batch-mode async \
+                  --dropbox-batch-size 100 \
+                  --dropbox-batch-timeout 5s \
+                  --buffer-size 256M \
                   2>&1 | tail -5
                 echo "Restored! Clearing Dropbox..."
-                rclone delete backup:nexus-volumes 2>/dev/null || true
-                rclone rmdir  backup:nexus-volumes 2>/dev/null || true
-                rclone mkdir  backup:nexus-volumes 2>/dev/null || true
+                sudo rclone delete backup:nexus-volumes 2>/dev/null || true
+                sudo rclone rmdir  backup:nexus-volumes 2>/dev/null || true
+                sudo rclone mkdir  backup:nexus-volumes 2>/dev/null || true
                 echo "Dropbox cleared and ready for next backup!"
               else
                 echo "Dropbox empty - using VM image data as-is"
@@ -297,7 +303,7 @@ jobs:
               -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 \
               -p 2222 nexus@localhost \
-              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available - skipping Dropbox'" \
+              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup sudo rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --transfers 32 --checkers 16 --dropbox-batch-mode async --dropbox-batch-size 100 --dropbox-batch-timeout 15s --buffer-size 256M --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available - skipping Dropbox'" \
           2>/dev/null || true
 
           # 3. Pause VM, copy image, resume immediately
@@ -319,14 +325,23 @@ jobs:
             /tmp/nexusserver.img.compressed
           echo "Compression done: $(du -sh /tmp/nexusserver.img.compressed)"
 
-          # 5. Stop Dropbox sync now that we're done
-          echo "Stopping Dropbox sync..."
+          # 5. Wait for Dropbox sync to fully complete (max 10 mins)
+          echo "Waiting for Dropbox sync to complete..."
           sshpass -p "$SSH_PASS" \
           ssh -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
-              -o ConnectTimeout=10 \
+              -o ConnectTimeout=120 \
               -p 2222 nexus@localhost \
-              "pkill -f 'rclone sync' 2>/dev/null || true && echo 'Dropbox sync stopped'" \
+              'for i in $(seq 1 60); do
+                if ! pgrep -f "rclone sync" > /dev/null 2>&1; then
+                  echo "Dropbox sync completed after ${i}0 seconds!"
+                  break
+                fi
+                echo "Dropbox sync in progress... ${i}/60"
+                sleep 10
+              done
+              pkill -f "rclone sync" 2>/dev/null || true
+              echo "Dropbox done"' \
           2>/dev/null || true
 
           # 6. Clean up snapshot
