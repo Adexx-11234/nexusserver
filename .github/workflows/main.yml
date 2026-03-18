@@ -1,62 +1,405 @@
-name: Check HuggingFace Last Upload
+name: NexusServer 24/7
 
 on:
+  # Manual trigger - use this to START the chain for the very first time
   workflow_dispatch:
+  # Self-trigger - fires only after this same workflow completes
+  # Guarantees a new run NEVER starts until HuggingFace upload is fully done
+  workflow_run:
+    workflows: ["NexusServer 24/7"]
+    types:
+      - completed
 
 jobs:
-  check-hf:
+  # Gate job: only continue if previous run succeeded (prevents failure loops)
+  check-previous:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check if previous run succeeded
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Manual trigger - starting chain!"
+          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Previous run succeeded - continuing chain!"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "Previous run did NOT succeed (was: ${{ github.event.workflow_run.conclusion }})"
+            echo "Chain stopped. Fix the issue then manually trigger via workflow_dispatch."
+          fi
+
+  run-server:
+    needs: check-previous
+    if: needs.check-previous.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
-      - name: Check Last Commit on HuggingFace Repo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM + Check Specs
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -aG kvm $USER
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+          echo "=== Runner Specs ==="
+          nproc
+          free -h
+          df -h
+          echo "===================="
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            qemu-kvm \
+            openssh-client \
+            sshpass \
+            curl \
+            wget \
+            net-tools \
+            socat
+          pip install huggingface_hub hf_transfer --break-system-packages -q
+          echo "Dependencies installed!"
+
+      - name: Download VM Image from Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          pip install huggingface_hub --break-system-packages -q
-          python3 - <<'PYEOF'
+          echo "Downloading VM image..."
+          mkdir -p ~/vms
+          HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<'PYEOF'
+          import os
+          from huggingface_hub import hf_hub_download
+          path = hf_hub_download(
+              repo_id="Paul1212crp/nexusserver-vm",
+              filename="nexusserver.img.compressed",
+              repo_type="dataset",
+              token=os.environ["HF_TOKEN"],
+              local_dir="/tmp"
+          )
+          print("Downloaded to:", path)
+          PYEOF
+          cp /tmp/nexusserver.img.compressed ~/vms/nexusserver.img
+          rm -f /tmp/nexusserver.img.compressed
+          echo "Image ready: $(du -sh ~/vms/nexusserver.img)"
+          qemu-img info ~/vms/nexusserver.img
+          df -h
+
+      - name: Boot VM
+        run: |
+          TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
+          VM_RAM=$(( TOTAL_RAM * 85 / 100 ))
+          CPUS=$(nproc)
+          echo "Booting VM with ${VM_RAM}MB RAM and ${CPUS} CPUs..."
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine q35,mem-merge=off \
+            -m ${VM_RAM} \
+            -smp ${CPUS} \
+            -cpu host,+x2apic \
+            -drive file=$HOME/vms/nexusserver.img,format=qcow2,if=virtio,cache=writeback,discard=unmap,aio=threads \
+            -boot order=c \
+            -device virtio-net-pci,netdev=n0 \
+            -netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8443-:8443,hostfwd=tcp::8080-:8080,hostfwd=tcp::3000-:3000,hostfwd=tcp::2055-:2055 \
+            -object rng-random,filename=/dev/urandom,id=rng0 \
+            -device virtio-rng-pci,rng=rng0 \
+            -device virtio-balloon-pci \
+            -serial file:$HOME/vms/nexusserver.serial.log \
+            -monitor unix:$HOME/vms/nexusserver.monitor,server,nowait \
+            -display none \
+            -daemonize \
+            -pidfile $HOME/vms/nexusserver.pid
+          echo "VM booted!"
+
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for VM SSH..."
+          for i in $(seq 1 60); do
+            if sshpass -p "${{ secrets.SSH_PASSWORD }}" \
+               ssh -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -o ConnectTimeout=5 \
+                   -p 2222 nexus@localhost \
+                   "echo SSH_READY" 2>/dev/null | grep -q "SSH_READY"; then
+              echo "VM is up after ${i}0 seconds!"
+              break
+            fi
+            echo "Attempt $i/60 - waiting 10s..."
+            sleep 10
+            tail -3 $HOME/vms/nexusserver.serial.log 2>/dev/null || true
+          done
+
+      - name: Setup sshx Service
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          sshpass -p "$SSH_PASS" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              -p 2222 nexus@localhost \
+              'sudo systemctl stop sshx 2>/dev/null || true
+               sudo systemctl disable sshx 2>/dev/null || true
+               echo "W1VuaXRdCkRlc2NyaXB0aW9uPXNzaHggdGVybWluYWwgc2hhcmluZwpBZnRlcj1uZXR3b3JrLnRhcmdldAoKW1NlcnZpY2VdClR5cGU9c2ltcGxlClVzZXI9bmV4dXMKR3JvdXA9bmV4dXMKRXhlY1N0YXJ0UHJlPS9iaW4vYmFzaCAtYyAicGtpbGwgLTkgc3NoeCB8fCB0cnVlOyBzbGVlcCAxIgpFeGVjU3RhcnQ9L3Vzci9sb2NhbC9iaW4vc3NoeApSZXN0YXJ0PWFsd2F5cwpSZXN0YXJ0U2VjPTEwCgpbSW5zdGFsbF0KV2FudGVkQnk9bXVsdGktdXNlci50YXJnZXQK" | base64 -d | sudo tee /etc/systemd/system/sshx.service > /dev/null
+               sudo systemctl daemon-reload
+               sudo systemctl enable sshx
+               sudo systemctl restart sshx
+               sleep 3
+               echo "sshx service started"'
+
+      - name: Setup VM + Restore Dropbox + Start Services
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          sshpass -p "$SSH_PASS" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=30 \
+              -p 2222 nexus@localhost bash <<'ENDSSH'
+            echo "=== System Info ==="
+            free -h && nproc && df -h /
+
+            echo "=== Fixing Nginx ==="
+            sudo sed -i '/# Disable caching for Livewire/,/^}/d' /etc/nginx/sites-available/pelican.conf 2>/dev/null || true
+            sudo nginx -t 2>/dev/null && sudo systemctl restart nginx 2>/dev/null || true
+
+            echo "=== Installing rclone if missing ==="
+            if ! command -v rclone &>/dev/null; then
+              curl https://rclone.org/install.sh | sudo bash 2>/dev/null
+              echo "rclone installed"
+            else
+              echo "rclone already installed"
+            fi
+
+            echo "=== Checking Dropbox ==="
+            if rclone listremotes 2>/dev/null | grep -q "backup:"; then
+              FILE_COUNT=$(rclone ls backup:nexus-volumes 2>/dev/null | wc -l)
+              echo "Files in Dropbox: $FILE_COUNT"
+              if [[ "$FILE_COUNT" -gt 0 ]]; then
+                echo "Restoring from Dropbox..."
+                sudo systemctl stop wings 2>/dev/null || true
+                sleep 2
+                rclone sync backup:nexus-volumes /var/lib/pelican/volumes \
+                  --copy-links \
+                  --exclude "node_modules/**" \
+                  --exclude ".git/**" \
+                  --exclude ".npm/**" \
+                  --exclude "*.log" \
+                  2>&1 | tail -5
+                echo "Restored! Clearing Dropbox..."
+                rclone delete backup:nexus-volumes 2>/dev/null || true
+                rclone rmdir  backup:nexus-volumes 2>/dev/null || true
+                rclone mkdir  backup:nexus-volumes 2>/dev/null || true
+                echo "Dropbox cleared and ready for next backup!"
+              else
+                echo "Dropbox empty - using VM image data as-is"
+              fi
+            else
+              echo "rclone not configured - skipping Dropbox restore"
+            fi
+
+            echo "=== Connecting Tailscale ==="
+            sudo tailscale up \
+              --authkey="$TAILSCALE_AUTHKEY" \
+              --hostname=nexusserver-gha \
+              --accept-routes 2>/dev/null || true
+            sleep 3
+            echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo pending)"
+
+            echo "=== Starting Services ==="
+            if [[ -f /root/.pelican.env ]] || [[ -f /var/www/pelican/.env ]]; then
+              echo "Pelican config found - starting all services..."
+              BASE_URL="https://raw.githubusercontent.com/Adexx-11234/newrepo/main"
+              curl -fsSL "${BASE_URL}/restart.sh" -o /tmp/nexus-restart.sh
+              sudo bash /tmp/nexus-restart.sh
+              rm -f /tmp/nexus-restart.sh
+            else
+              echo "WARNING: No Pelican config found!"
+            fi
+
+            echo "=== Final Nginx Check ==="
+            sudo nginx -t 2>/dev/null && sudo systemctl restart nginx 2>/dev/null || true
+
+            echo "=== Services Status ==="
+            sudo systemctl is-active wings nginx php8.3-fpm cloudflared 2>/dev/null || true
+            echo "Tailscale IP: $(tailscale ip -4 2>/dev/null || echo not connected)"
+          ENDSSH
+
+      - name: Show Access Details
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          sleep 15
+
+          TAILSCALE_IP=$(sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "tailscale ip -4 2>/dev/null || echo pending" 2>/dev/null)
+
+          SSHX_LINK=$(sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "sudo journalctl -u sshx -n 20 --no-pager 2>/dev/null | grep -o 'https://sshx.io/s/[^ ]*' | tail -1 || echo 'not ready'" 2>/dev/null)
+
+          PUBLIC_IP=$(sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "curl -s ifconfig.me 2>/dev/null" 2>/dev/null)
+
+          echo ""
+          echo "======================================================="
+          echo "         NEXUSSERVER IS LIVE!"
+          echo "            Created by NexusTechPro"
+          echo "======================================================="
+          echo "  Username:     nexus"
+          echo "  Password:     $SSH_PASS"
+          echo "  Public IP:    ${PUBLIC_IP}"
+          echo "  Tailscale IP: ${TAILSCALE_IP}"
+          echo "======================================================="
+          echo "  Panel:   https://panel.nexusbot.qzz.io"
+          echo "  Wings:   https://node-1.nexusbot.qzz.io"
+          echo "======================================================="
+          echo "  CLICK LINK BELOW TO ACCESS YOUR TERMINAL:"
+          echo "  ${SSHX_LINK}"
+          echo "======================================================="
+          echo "  SSH: ssh nexus@${TAILSCALE_IP}"
+          echo "  VM runs for 4.5 hours then auto-restarts"
+          echo "  Smart Dropbox sync preserves all data"
+          echo "======================================================="
+          echo "SERVER IS LIVE! Click the sshx link above!"
+
+      - name: Keep Alive + Smart Backup
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          echo "Server running! Keeping alive for 4.5 hours..."
+          START=$(date +%s)
+
+          for i in {1..27}; do
+            sleep 600
+            ELAPSED=$(( ($(date +%s) - START) / 60 ))
+            echo "[$i/27] Running ${ELAPSED} mins - $(date '+%H:%M:%S')"
+            sshpass -p "$SSH_PASS" \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                -p 2222 nexus@localhost \
+                "echo OK && sudo systemctl is-active wings nginx 2>/dev/null && tailscale ip -4 2>/dev/null" \
+            2>/dev/null || echo "Health check failed at $i"
+          done
+
+          echo "=== 4.5 hours complete - Starting Smart Backup ==="
+
+          # 1. Flush all VM writes to disk
+          echo "Flushing VM writes..."
+          sshpass -p "$SSH_PASS" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 nexus@localhost \
+              "sudo sync && sudo sync && sudo sync" 2>/dev/null || true
+          sleep 3
+
+          # 2. Start Dropbox sync in background BEFORE pausing VM
+          echo "Starting Dropbox sync in background..."
+          sshpass -p "$SSH_PASS" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 nexus@localhost \
+              "command -v rclone &>/dev/null && rclone listremotes 2>/dev/null | grep -q 'backup:' && nohup rclone sync /var/lib/pelican/volumes backup:nexus-volumes --copy-links --exclude 'node_modules/**' --exclude '.git/**' --exclude '.npm/**' --exclude '*.log' --log-file=/var/log/rclone-backup.log > /dev/null 2>&1 & echo 'Dropbox sync started' || echo 'rclone not available - skipping Dropbox'" \
+          2>/dev/null || true
+
+          # 3. Pause VM, copy image, resume immediately
+          echo "Pausing VM..."
+          printf 'stop\n' | socat -u STDIN UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+          sleep 3
+
+          echo "Copying VM image..."
+          cp $HOME/vms/nexusserver.img $HOME/vms/nexusserver.snapshot.img
+          echo "Copy done: $(du -sh $HOME/vms/nexusserver.snapshot.img)"
+
+          echo "Resuming VM - users back online!"
+          printf 'cont\n' | socat -u STDIN UNIX-CONNECT:$HOME/vms/nexusserver.monitor
+
+          # 4. Compress snapshot while VM is live
+          echo "Compressing snapshot (VM is live)..."
+          qemu-img convert -O qcow2 -c \
+            $HOME/vms/nexusserver.snapshot.img \
+            /tmp/nexusserver.img.compressed
+          echo "Compression done: $(du -sh /tmp/nexusserver.img.compressed)"
+
+          # 5. Stop Dropbox sync now that we're done
+          echo "Stopping Dropbox sync..."
+          sshpass -p "$SSH_PASS" \
+          ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 nexus@localhost \
+              "pkill -f 'rclone sync' 2>/dev/null || true && echo 'Dropbox sync stopped'" \
+          2>/dev/null || true
+
+          # 6. Clean up snapshot
+          rm -f $HOME/vms/nexusserver.snapshot.img
+
+          # 7. Verify compressed image exists before upload step
+          if [[ ! -f /tmp/nexusserver.img.compressed ]]; then
+            echo "ERROR: Compressed image missing - backup failed!"
+            exit 1
+          fi
+          echo "Backup ready: $(du -sh /tmp/nexusserver.img.compressed)"
+
+      - name: Upload Updated Image to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Double-check file exists (in case previous step had issues)
+          if [[ ! -f /tmp/nexusserver.img.compressed ]]; then
+            echo "ERROR: No compressed image found to upload!"
+            exit 1
+          fi
+          echo "Uploading to Hugging Face: $(du -sh /tmp/nexusserver.img.compressed)"
+          HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<'PYEOF'
           import os
           from huggingface_hub import HfApi
-          from datetime import datetime, timezone
+          from datetime import datetime
 
           api = HfApi(token=os.environ["HF_TOKEN"])
-
-          print("=== Checking HuggingFace Repo ===")
-
-          # Get commit history
-          commits = list(api.list_repo_commits(
+          print("Uploading nexusserver.img.compressed...")
+          api.upload_file(
+              path_or_fileobj="/tmp/nexusserver.img.compressed",
+              path_in_repo="nexusserver.img.compressed",
               repo_id="Paul1212crp/nexusserver-vm",
-              repo_type="dataset"
-          ))
-
-          latest = commits[0]
-          print(f"Total commits: {len(commits)}")
-          print(f"Latest commit: {latest.commit_id[:12]}")
-          print(f"Message:       {latest.title}")
-          print(f"Date:          {latest.created_at}")
-
-          # How long ago
-          now = datetime.now(timezone.utc)
-          age = now - latest.created_at
-          hours = int(age.total_seconds() // 3600)
-          mins  = int((age.total_seconds() % 3600) // 60)
-          print(f"Age:           {hours}h {mins}m ago")
-
-          # Get file info
-          files = list(api.list_repo_tree(
-              repo_id="Paul1212crp/nexusserver-vm",
-              repo_type="dataset"
-          ))
-          for f in files:
-              if hasattr(f, 'size') and f.size:
-                  size_gb = f.size / (1024**3)
-                  print(f"\nFile: {f.path}")
-                  print(f"Size: {size_gb:.2f} GB ({f.size:,} bytes)")
-                  print(f"Blob: {f.blob_id[:12] if f.blob_id else 'N/A'}")
-
-          print("\n=== Check Complete ===")
-          if "Auto-save" in latest.title or "Backup" in latest.title:
-              print("✅ Latest commit looks like an auto-save from the workflow!")
-          else:
-              print("⚠️  Latest commit does NOT look like an auto-save - upload may have failed.")
+              repo_type="dataset",
+              commit_message="Auto-save: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+          )
+          print("Upload complete! Image saved to Hugging Face.")
           PYEOF
+          echo "Done! Next run will boot from this updated image."
+
+      - name: Trigger Next Run
+        run: |
+          echo "Upload confirmed complete - triggering next run now..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" \
+            -d '{"ref":"main"}' && echo "Next run triggered!" || echo "Trigger failed - workflow_run will handle it"
