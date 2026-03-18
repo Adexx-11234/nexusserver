@@ -30,7 +30,7 @@ RUN apt-get update -qq && \
         ca-certificates \
         python3 \
         python3-pip && \
-    pip3 install --break-system-packages huggingface_hub hf_transfer && \
+    pip3 install huggingface_hub hf_transfer && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install Tailscale
