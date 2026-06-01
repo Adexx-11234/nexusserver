@@ -5,7 +5,7 @@ on:
 
 jobs:
   run-server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
