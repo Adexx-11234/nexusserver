@@ -1,0 +1,222 @@
+name: NexusServer 24/7
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System Info
+        run: |
+          echo "=== Runner Specs ==="
+          uname -a
+          nproc
+          free -h
+          df -h
+          echo "===================="
+
+      - name: Open All Ports (inbound + outbound)
+        run: |
+          # Disable UFW entirely
+          sudo ufw disable 2>/dev/null || true
+          sudo systemctl stop ufw 2>/dev/null || true
+
+          # Flush all iptables rules and set ACCEPT policy on all chains
+          sudo iptables -F
+          sudo iptables -X
+          sudo iptables -Z
+          sudo iptables -P INPUT ACCEPT
+          sudo iptables -P FORWARD ACCEPT
+          sudo iptables -P OUTPUT ACCEPT
+
+          # Same for ip6tables
+          sudo ip6tables -F
+          sudo ip6tables -X
+          sudo ip6tables -Z
+          sudo ip6tables -P INPUT ACCEPT
+          sudo ip6tables -P FORWARD ACCEPT
+          sudo ip6tables -P OUTPUT ACCEPT
+
+          echo "All ports open (inbound + outbound)"
+          sudo iptables -L -n
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            openssh-server \
+            curl \
+            wget \
+            git \
+            socat \
+            net-tools \
+            iproute2 \
+            ca-certificates \
+            gnupg \
+            software-properties-common \
+            build-essential \
+            unzip \
+            htop \
+            vim \
+            screen \
+            tmux \
+            python3 \
+            python3-pip
+          echo "Dependencies installed!"
+
+      - name: Install Google Chrome
+        run: |
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || \
+            (sudo dpkg -i /tmp/chrome.deb; sudo apt-get install -f -y)
+          rm -f /tmp/chrome.deb
+          google-chrome --version
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          echo "Tailscale installed"
+
+      - name: Install sshx
+        run: |
+          curl -sSf https://sshx.io/get | sudo sh
+          echo "sshx installed"
+
+      - name: Configure SSH Server
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          # Create nexus user
+          sudo useradd -m -s /bin/bash nexus 2>/dev/null || true
+          echo "nexus:${SSH_PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo nexus
+
+          # Allow sudo without password
+          echo 'nexus ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/nexus
+
+          # Configure SSH to allow password auth on all interfaces
+          sudo tee /etc/ssh/sshd_config > /dev/null << 'SSHCONF'
+          Port 22
+          Port 2222
+          AddressFamily any
+          ListenAddress 0.0.0.0
+          ListenAddress ::
+
+          PermitRootLogin no
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          ChallengeResponseAuthentication no
+          UsePAM yes
+
+          X11Forwarding yes
+          PrintMotd no
+          AcceptEnv LANG LC_*
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          SSHCONF
+
+          sudo systemctl restart ssh || sudo service ssh restart
+          sudo systemctl enable ssh 2>/dev/null || true
+          echo "SSH server running on ports 22 and 2222"
+          sudo ss -tlnp | grep ssh
+
+      - name: Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname=nexusserver-gha \
+            --accept-routes \
+            --ssh 2>/dev/null || true
+          sleep 5
+          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+          echo "Tailscale IP: ${TAILSCALE_IP}"
+          echo "TAILSCALE_IP=${TAILSCALE_IP}" >> $GITHUB_ENV
+
+      - name: Start sshx
+        run: |
+          # Run sshx as nexus user in background
+          sudo -u nexus sshx > /tmp/sshx.log 2>&1 &
+          sleep 10
+          SSHX_LINK=$(grep -o 'https://sshx.io/s/[^ ]*' /tmp/sshx.log | tail -1 || echo "not ready")
+          echo "sshx link: ${SSHX_LINK}"
+          echo "SSHX_LINK=${SSHX_LINK}" >> $GITHUB_ENV
+
+      - name: Show Access Details
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
+          echo ""
+          echo "======================================================="
+          echo "         NEXUSSERVER IS LIVE!"
+          echo "           Created by NexusTechPro"
+          echo "======================================================="
+          echo "  OS:           Ubuntu $(lsb_release -rs 2>/dev/null)"
+          echo "  Username:     nexus"
+          echo "  Password:     ${SSH_PASSWORD}"
+          echo "  Public IP:    ${PUBLIC_IP}"
+          echo "  Tailscale IP: ${TAILSCALE_IP}"
+          echo "======================================================="
+          echo "  SSH (public): ssh nexus@${PUBLIC_IP}"
+          echo "  SSH (ts):     ssh nexus@${TAILSCALE_IP}"
+          echo "  SSH (local):  ssh -p 2222 nexus@localhost"
+          echo "======================================================="
+          echo "  Chrome:   google-chrome --no-sandbox"
+          echo "  All ports: OPEN (inbound + outbound)"
+          echo "======================================================="
+          echo "  CLICK LINK BELOW TO ACCESS YOUR TERMINAL:"
+          echo "  ${SSHX_LINK}"
+          echo "======================================================="
+          echo "  Server runs for ~5.8 hours then auto-restarts"
+          echo "======================================================="
+
+      - name: Keep Alive
+        run: |
+          echo "Server running! Keeping alive for 5.8 hours..."
+          START=$(date +%s)
+
+          for i in {1..35}; do
+            sleep 600
+            ELAPSED=$(( ($(date +%s) - START) / 60 ))
+
+            # Re-read sshx link in case it changed
+            SSHX_LINK=$(grep -o 'https://sshx.io/s/[^ ]*' /tmp/sshx.log 2>/dev/null | tail -1 || echo "check log")
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
+
+            echo "[$i/35] Uptime: ${ELAPSED} min | $(date '+%H:%M:%S')"
+            echo "  sshx:      ${SSHX_LINK}"
+            echo "  Tailscale: ${TAILSCALE_IP}"
+            echo "  Disk:      $(df -h / | tail -1 | awk '{print $4}') free"
+            echo "  RAM:       $(free -h | awk '/^Mem:/{print $3 "/" $2}')"
+
+            # Restart sshx if it died
+            if ! pgrep -f sshx > /dev/null; then
+              echo "  sshx died - restarting..."
+              sudo -u nexus sshx >> /tmp/sshx.log 2>&1 &
+              sleep 5
+              SSHX_LINK=$(grep -o 'https://sshx.io/s/[^ ]*' /tmp/sshx.log | tail -1 || echo "restarting")
+              echo "  New sshx link: ${SSHX_LINK}"
+            fi
+          done
+
+          echo "5.8 hours complete - triggering next run..."
+
+      - name: Trigger Next Run
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" \
+            -d '{"ref":"main"}' \
+          && echo "Next run triggered!" \
+          || echo "Trigger failed - run workflow_dispatch manually to restart"
